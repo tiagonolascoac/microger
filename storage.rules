@@ -1,0 +1,16 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function owner(orgId) {
+      return request.auth != null &&
+        firestore.get(/databases/(default)/documents/organizations/$(orgId)).data.ownerId == request.auth.uid;
+    }
+    match /organizations/{orgId}/workspaces/{spaceId}/branding/logo {
+      allow read: if owner(orgId);
+      allow create, update: if owner(orgId) &&
+        request.resource.size < 2 * 1024 * 1024 &&
+        request.resource.contentType.matches('image/(jpeg|png|webp)');
+      allow delete: if false;
+    }
+  }
+}

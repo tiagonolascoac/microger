@@ -1,0 +1,164 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+    function orgPath(orgId) {
+      return /databases/$(database)/documents/organizations/$(orgId);
+    }
+    function spacePath(orgId, spaceId) {
+      return /databases/$(database)/documents/organizations/$(orgId)/workspaces/$(spaceId);
+    }
+    function orgOwner(orgId) {
+      return signedIn() && exists(orgPath(orgId)) &&
+        get(orgPath(orgId)).data.ownerId == request.auth.uid;
+    }
+    function financeEnabled(orgId, spaceId) {
+      return exists(spacePath(orgId, spaceId)) &&
+        'finance' in get(spacePath(orgId, spaceId)).data.enabledModules;
+    }
+    function categoryPath(orgId, spaceId, categoryId) {
+      return /databases/$(database)/documents/organizations/$(orgId)/workspaces/$(spaceId)/financeCategories/$(categoryId);
+    }
+    function validCategory(data) {
+      return data.keys().hasAll(['name', 'type', 'active', 'createdBy', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['name', 'type', 'active', 'createdBy', 'createdAt', 'updatedAt']) &&
+        data.name is string && data.name.size() > 0 && data.name.size() <= 60 &&
+        data.type in ['income', 'expense'] && data.active is bool &&
+        data.createdBy is string && data.createdAt is timestamp && data.updatedAt is timestamp;
+    }
+    function validCategoryReference(data, orgId, spaceId) {
+      return !('categoryId' in data) || (
+        data.categoryId is string && data.categoryId.size() > 0 &&
+        exists(categoryPath(orgId, spaceId, data.categoryId)) &&
+        get(categoryPath(orgId, spaceId, data.categoryId)).data.active == true &&
+        get(categoryPath(orgId, spaceId, data.categoryId)).data.type == data.type &&
+        get(categoryPath(orgId, spaceId, data.categoryId)).data.name == data.category
+      );
+    }
+    function hexColor(color) {
+      return color is string && color.matches('^#[0-9a-fA-F]{6}$');
+    }
+    function validWorkspace(data, orgId, spaceId) {
+      return data.keys().hasAll([
+          'name', 'templateId', 'enabledModules', 'theme',
+          'logoPath', 'createdBy', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'name', 'templateId', 'enabledModules', 'theme',
+          'logoPath', 'createdBy', 'createdAt', 'updatedAt'
+        ]) &&
+        data.name is string && data.name.size() > 0 && data.name.size() <= 80 &&
+        (
+          (data.templateId == 'academy' && data.enabledModules == ['academy', 'finance']) ||
+          (data.templateId == 'financial' && data.enabledModules == ['finance'])
+        ) &&
+        data.theme is map &&
+        data.theme.keys().hasAll(['primary', 'accent']) &&
+        data.theme.keys().hasOnly(['primary', 'accent']) &&
+        hexColor(data.theme.primary) && hexColor(data.theme.accent) &&
+        (data.logoPath == null || data.logoPath ==
+          'organizations/' + orgId + '/workspaces/' + spaceId + '/branding/logo') &&
+        data.createdBy is string && data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+    function validTransaction(data, orgId, spaceId) {
+      return data.keys().hasAll([
+          'type', 'amountCents', 'category', 'description',
+          'occurredOn', 'createdBy', 'createdAt'
+        ]) &&
+        data.keys().hasOnly([
+          'type', 'amountCents', 'category', 'description',
+          'occurredOn', 'createdBy', 'createdAt', 'categoryId'
+        ]) &&
+        data.type in ['income', 'expense'] &&
+        data.amountCents is int && data.amountCents > 0 &&
+        data.category is string && data.category.size() > 0 && data.category.size() <= 60 &&
+        data.description is string && data.description.size() <= 250 &&
+        data.occurredOn is string &&
+        data.occurredOn.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') &&
+        data.createdBy == request.auth.uid &&
+        data.createdAt == request.time &&
+        validCategoryReference(data, orgId, spaceId);
+    }
+
+    match /users/{uid} {
+      allow create: if signedIn() && uid == request.auth.uid &&
+        request.resource.data.keys().hasAll(['name', 'email', 'createdAt']) &&
+        request.resource.data.keys().hasOnly(['name', 'email', 'createdAt']) &&
+        request.resource.data.name is string &&
+        request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 80 &&
+        request.resource.data.email == request.auth.token.email &&
+        request.resource.data.createdAt == request.time;
+      allow get: if signedIn() && uid == request.auth.uid;
+      allow list, update, delete: if false;
+    }
+
+    match /organizations/{orgId} {
+      allow create: if signedIn() &&
+        request.resource.data.keys().hasAll(['name', 'ownerId', 'createdAt']) &&
+        request.resource.data.keys().hasOnly(['name', 'ownerId', 'createdAt']) &&
+        request.resource.data.ownerId == request.auth.uid &&
+        request.resource.data.name is string &&
+        request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 80 &&
+        request.resource.data.createdAt == request.time;
+      // A consulta de organizações precisa filtrar ownerId == uid.
+      allow read: if signedIn() && resource.data.ownerId == request.auth.uid;
+      allow update, delete: if false;
+
+      match /workspaces/{spaceId} {
+        allow create: if orgOwner(orgId) &&
+          validWorkspace(request.resource.data, orgId, spaceId) &&
+          request.resource.data.createdBy == request.auth.uid &&
+          request.resource.data.createdAt == request.time &&
+          request.resource.data.updatedAt == request.time;
+        allow read: if orgOwner(orgId);
+        allow update: if orgOwner(orgId) &&
+          validWorkspace(request.resource.data, orgId, spaceId) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'name', 'theme', 'logoPath', 'updatedAt'
+          ]) &&
+          request.resource.data.updatedAt == request.time;
+        allow delete: if false;
+
+        match /financeCategoryConfig/{configId} {
+          allow read: if orgOwner(orgId) && financeEnabled(orgId, spaceId);
+          allow create: if orgOwner(orgId) && financeEnabled(orgId, spaceId) &&
+            configId == 'initialization' &&
+            request.resource.data.keys().hasAll(['initialized', 'schemaVersion', 'createdBy', 'createdAt']) &&
+            request.resource.data.keys().hasOnly(['initialized', 'schemaVersion', 'createdBy', 'createdAt']) &&
+            request.resource.data.initialized == true &&
+            request.resource.data.schemaVersion == 1 &&
+            request.resource.data.createdBy == request.auth.uid &&
+            request.resource.data.createdAt == request.time;
+          allow update, delete: if false;
+        }
+
+        match /financeCategories/{categoryId} {
+          allow read: if orgOwner(orgId) && financeEnabled(orgId, spaceId);
+          allow create: if orgOwner(orgId) && financeEnabled(orgId, spaceId) &&
+            validCategory(request.resource.data) &&
+            request.resource.data.active == true &&
+            request.resource.data.createdBy == request.auth.uid &&
+            request.resource.data.createdAt == request.time &&
+            request.resource.data.updatedAt == request.time;
+          allow update: if orgOwner(orgId) && financeEnabled(orgId, spaceId) &&
+            validCategory(request.resource.data) &&
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'active', 'updatedAt']) &&
+            request.resource.data.updatedAt == request.time;
+          // Arquivar preserva lançamentos históricos e suas referências.
+          allow delete: if false;
+        }
+
+        match /financeTransactions/{transactionId} {
+          allow read: if orgOwner(orgId) && financeEnabled(orgId, spaceId);
+          allow create: if orgOwner(orgId) && financeEnabled(orgId, spaceId) &&
+            validTransaction(request.resource.data, orgId, spaceId);
+          allow delete: if orgOwner(orgId) && financeEnabled(orgId, spaceId);
+          allow update: if false;
+        }
+      }
+    }
+  }
+}
